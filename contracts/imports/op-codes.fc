@@ -1,0 +1,32 @@
+;; Jettons
+const int op::transfer_jetton = 0xf8a7ea5;
+const int op::transfer_notification = 0x7362d09c;
+const int op::burn_jetton = 0x595f07bc;
+
+;; NFT-collection
+const int op::change_owner = 0x3;
+const int op::change_price = 0x96189f94;
+const int op::change_min_purchase = 0xbe76c53;
+const int op::change_whitelist = 0x8c1bad07;
+const int op::withdraw_ton = 0x37726bdb;
+const int op::withdraw_jetton = 0x11c09682;
+const int op::get_info = 0x6;
+const int op::buy_wl = 0x90612494; 
+
+
+;; SBT
+const int op::transfer = 0x5fcc3d14;
+const int op::request_owner = 0xd0c3bfea;
+const int op::owner_info = 0x0dd607e3;
+const int op::prove_ownership = 0x04ded148;
+const int op::ownership_proof = 0x0524c7ae;
+const int op::ownership_proof_bounced = 0xc18e86d2;
+const int op::destroy = 0x1f04537a;
+const int op::revoke = 0x6f89f5e3;
+const int op::take_excess = 0xd136d3b3;
+const int op::excesses = 0xd53276db;
+const int op::get_static_data = 0x2fcb26a2;
+const int op::report_static_data = 0x8b771735;
+const int op::get_royalty_params = 0x693d3950;
+const int op::report_royalty_params = 0xa8cb00ad;
+const int op::claim = 0xa769de27;

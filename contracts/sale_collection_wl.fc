@@ -1,0 +1,425 @@
+{- 
+JVT private sale smart contract. Implements lockup period, linear vesting, minimum purchase limit and 
+different conditions for whitelisted and not whitelisted addresses.
+It is possible to restrict not whitelisted addresses from participating in sale buy setting "price devider" to zero.
+-}
+#include "imports/stdlib.fc";
+#include "imports/op-codes.fc";
+#include "imports/params.fc";
+#include "imports/jetton_utils.fc";
+
+const int tons_for_gas = 150000000;
+const int tons_for_computing = 10000000;
+int min_tons_for_storage() asm "50000000 PUSHINT"; ;; 0.05 TON
+
+global slice storage::owner_address;          ;; owner address (MsgAddress)
+global int storage::next_item_index;          ;; next item index (uint64)
+global cell storage::content;                 ;; collection content (Cell)
+global cell storage::nft_item_code;           ;; NFT code (Cell)
+global int storage::min_purchase_ton;         ;; min TON for buying (Coins)
+global int storage::price_factor;             ;; jetton price factor (uint128)
+global int storage::price_devider;            ;; jetton price devider (uint128)
+global int storage::available_jettons;        ;; available jettons for sale (Coins)
+global slice storage::jetton_minter_address;  ;; jetton minter address (MsgAddress)
+global cell storage::jetton_wallet_code;      ;; jetton wallet code (Cell)
+global slice storage::jetton_wallet_address;  ;; jetton wallet address of this smc (MsgAddress)
+global int storage::first_unlock_time;        ;; time of first unlock in seconds (uint32)
+global int storage::initial_unlock;           ;; percent of tokens unlocked at first (uint16)
+global int storage::cycle_length;             ;; time between unlocks in seconds (uint32)
+global int storage::cycles_number;            ;; number of unlocks excluding initial (uint16)
+global cell storage::whitelist;               ;; list of wallets with better conditions
+
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    storage::owner_address         = ds~load_msg_addr();
+    storage::next_item_index       = ds~load_uint(64);
+    storage::content               = ds~load_ref();
+    storage::nft_item_code         = ds~load_ref();
+    storage::min_purchase_ton      = ds~load_coins();
+    storage::price_factor          = ds~load_uint(128);
+    storage::price_devider         = ds~load_uint(128);
+    storage::first_unlock_time     = ds~load_uint(32);
+    storage::initial_unlock        = ds~load_uint(16);
+    storage::cycle_length          = ds~load_uint(32);
+    storage::cycles_number         = ds~load_uint(16);
+
+    slice jetton_info = ds~load_ref().begin_parse();
+    storage::available_jettons     = jetton_info~load_coins();
+    storage::jetton_minter_address = jetton_info~load_msg_addr();
+    storage::jetton_wallet_code    = jetton_info~load_ref();
+    storage::jetton_wallet_address = jetton_info~load_msg_addr();
+
+    storage::whitelist = ds~load_ref();
+}
+
+
+() save_data() impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(storage::owner_address)
+            .store_uint(storage::next_item_index, 64)
+            .store_ref(storage::content)
+            .store_ref(storage::nft_item_code)
+            .store_coins(storage::min_purchase_ton)
+            .store_uint(storage::price_factor, 128)
+            .store_uint(storage::price_devider, 128)
+            .store_uint(storage::first_unlock_time, 32)
+            .store_uint(storage::initial_unlock, 16)
+            .store_uint(storage::cycle_length, 32)
+            .store_uint(storage::cycles_number, 16)
+            .store_ref(
+                begin_cell()
+                    .store_coins(storage::available_jettons)
+                    .store_slice(storage::jetton_minter_address)
+                    .store_ref(storage::jetton_wallet_code)
+                    .store_slice(storage::jetton_wallet_address)
+                .end_cell()
+            )
+            .store_ref(storage::whitelist)
+        .end_cell()
+    );
+}
+
+
+cell calculate_nft_item_state_init(int item_index) inline {
+    cell data = begin_cell().store_uint(item_index, 64).store_slice(my_address()).end_cell();
+    return begin_cell().store_uint(0, 2).store_dict(storage::nft_item_code).store_dict(data).store_uint(0, 1).end_cell();
+}
+
+
+slice calculate_nft_item_address(int wc, cell state_init) inline { 
+    return begin_cell().store_uint(4, 3)
+                        .store_int(wc, 8)
+                        .store_uint(cell_hash(state_init), 256)
+                        .end_cell()
+                        .begin_parse();
+}
+
+
+() sell_tokens(int msg_value, slice to_address, int price_factor, int price_devider, int min_purchase_ton) impure inline {
+    throw_unless(416, msg_value - tons_for_gas >= min_purchase_ton);
+    
+    int purchased_amount = (msg_value - tons_for_gas) / price_factor * price_devider;
+    throw_unless(417, purchased_amount <= storage::available_jettons);
+
+    cell state_init = calculate_nft_item_state_init(storage::next_item_index);
+    slice nft_address = calculate_nft_item_address(workchain(), state_init);
+    
+    slice nft_jetton_address = calculate_user_jetton_wallet_address(nft_address, storage::jetton_minter_address, storage::jetton_wallet_code);
+    cell nft_content = begin_cell()
+                            .store_slice(to_address)
+                            .store_ref(
+                                begin_cell()
+                                    .store_uint(storage::next_item_index, 64)
+                                    .store_slice(nft_jetton_address)
+                                    .store_coins(purchased_amount)
+                                    .store_coins(0)
+                                    .store_uint(storage::first_unlock_time, 32)
+                                    .store_uint(storage::initial_unlock, 16)
+                                    .store_uint(storage::cycle_length, 32)
+                                    .store_uint(storage::cycles_number, 16)
+                                .end_cell()
+                            )
+                        .end_cell();
+
+    var msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(nft_address)
+                .store_coins(70000000)
+                .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+                .store_ref(state_init)
+                .store_ref(nft_content);
+
+    send_raw_message(msg.end_cell(), 0);  ;; deploy new nft
+
+    cell msg_body = begin_cell()
+                        .store_uint(op::transfer_jetton, 32)
+                        .store_uint(0, 64)
+                        .store_coins(purchased_amount)
+                        .store_slice(nft_address)
+                        .store_slice(my_address())
+                        .store_uint(0, 1)
+                        .store_coins(1)
+                        .store_uint(0, 1)
+                    .end_cell();
+
+    var msg = begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(storage::jetton_wallet_address)
+                .store_coins(70000000)
+                .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_ref(msg_body);
+
+    send_raw_message(msg.end_cell(), 0);
+
+    storage::available_jettons -= purchased_amount;
+    storage::next_item_index += 1;
+
+    save_data();
+}
+
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {  ;; empty message -> buy
+        if (msg_value < tons_for_gas) {
+            return ();
+        }
+        load_data();
+        slice cs = in_msg_full.begin_parse();
+        cs~skip_bits(4);
+        sell_tokens(msg_value, cs~load_msg_addr(), storage::price_factor, storage::price_devider, storage::min_purchase_ton);
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {  ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+    
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0) {  ;; message with comment -> buy
+        sell_tokens(msg_value, sender_address, storage::price_factor, storage::price_devider, storage::min_purchase_ton);
+        return ();
+    }
+
+    int query_id = in_msg_body~load_uint(64);
+
+    ;; While buying from whitelisted wallet, instructions for searching wallet address in the WL 
+    ;; (kind of index in this data structure) should be provided. It can be calculated off-chain easily. 
+    ;; This decrease the algorithm complexity from O(N) to O(log N)
+    if (op == op::buy_wl) {
+        slice ws = storage::whitelist.begin_parse();
+        int wl_index = in_msg_body~load_uint(2);  ;; this sale supports up to 4 whitelist levels
+        while (wl_index != 0) {
+            ws~load_ref();
+            wl_index -= 1;
+        }
+        slice wl_parsed = ws~load_ref().begin_parse();
+
+        ;; The root cell of the whitelist consists of conditions of sale for whitelisted wallets
+        int price_factor_wl = wl_parsed~load_uint(128); 
+        int price_devider_wl = wl_parsed~load_uint(128);
+        int min_purchase_ton_wl = wl_parsed~load_coins();
+        
+        ;; All the other cells consist of wallet addresses (three addresses in each cell)
+        int index_in_wl = in_msg_body~load_uint(128);
+        int test_tmp = index_in_wl;
+        int depth = in_msg_body~load_uint(7);
+        slice cur_slice = wl_parsed;
+        while (depth != -1) {
+            int tmp_index = index_in_wl & 3;
+            while (tmp_index != 0) {
+                cur_slice~load_ref();
+                tmp_index -= 1;
+            }
+            cur_slice = cur_slice~load_ref().begin_parse();
+            depth -= 1;
+            index_in_wl >>= 2;
+        }
+        cur_slice~skip_bits((index_in_wl & 3) * 267);
+        throw_unless(403, equal_slices(cur_slice~load_msg_addr(), sender_address));
+
+        sell_tokens(msg_value - tons_for_computing, sender_address, price_factor_wl, price_devider_wl, min_purchase_ton_wl);
+        return ();
+    }
+
+    if (op == op::change_owner) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+        storage::owner_address = in_msg_body~load_msg_addr();
+        save_data();
+
+        return ();
+    }
+
+    if (op == op::change_price) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+        storage::price_factor = in_msg_body~load_uint(128);
+        storage::price_devider = in_msg_body~load_uint(128);
+        save_data();
+
+        return ();
+    }
+
+    if (op == op::change_min_purchase) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+        storage::min_purchase_ton = in_msg_body~load_coins();
+        save_data();
+
+        return ();
+    }
+
+    if (op == op::change_whitelist) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+        storage::whitelist = in_msg_body~load_ref();
+        save_data();
+
+        return ();
+    }
+
+    if (op == op::withdraw_ton) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+        raw_reserve(min_tons_for_storage(), 0);
+
+        var msg = begin_cell()
+                    .store_uint(0x10, 6) 
+                    .store_slice(storage::owner_address)  ;; previous owner address
+                    .store_coins(0)
+                    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                  .end_cell();
+        send_raw_message(msg, 128);
+        
+        return ();
+    }
+
+    if (op == op::withdraw_jetton) {
+        throw_unless(403, equal_slices(sender_address, storage::owner_address));
+
+        int withdraw_amount = storage::available_jettons;
+        if (~ in_msg_body.slice_empty?()) {
+            withdraw_amount = in_msg_body~load_coins();
+        }
+        cell msg_body = begin_cell()
+                            .store_uint(op::transfer_jetton, 32)
+                            .store_uint(0, 64)
+                            .store_coins(withdraw_amount)
+                            .store_slice(storage::owner_address)
+                            .store_slice(storage::owner_address)
+                            .store_uint(0, 1)
+                            .store_coins(1)
+                            .store_uint(0, 1)
+                        .end_cell();
+
+        var msg = begin_cell()
+                    .store_uint(0x10, 6)
+                    .store_slice(storage::jetton_wallet_address)
+                    .store_coins(0)
+                    .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                    .store_ref(msg_body);
+
+        send_raw_message(msg.end_cell(), 64);
+        if (storage::available_jettons > withdraw_amount) {
+            storage::available_jettons -= withdraw_amount;
+        }
+        save_data();
+        
+        return ();
+    }
+
+    if (op == op::transfer_notification) {
+        if (storage::jetton_wallet_address.preload_uint(2) != 0) {  ;; "if jetton wallet address is already saved"
+            throw_unless(403, equal_slices(sender_address, storage::jetton_wallet_address));
+        }
+        else {
+            storage::jetton_wallet_address = calculate_user_jetton_wallet_address(my_address(), storage::jetton_minter_address, storage::jetton_wallet_code);
+        }
+        storage::available_jettons += in_msg_body~load_coins();
+        save_data();
+
+        return ();
+    }
+
+    if (op == op::get_info) {
+        cell info_msg = begin_cell()
+                        .store_uint(0x18, 6)
+                        .store_slice(sender_address)
+                        .store_coins(0)
+                        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1)
+                        .store_uint(1, 1)
+                        .store_ref(get_data())
+                    .end_cell();
+        send_raw_message(info_msg, 64); 
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+
+(int, cell, slice) get_collection_data() method_id {
+    load_data();
+    slice cs = storage::content.begin_parse();
+    return (storage::next_item_index, cs~load_ref(), "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"a);
+}
+
+
+slice get_nft_address_by_index(int index) method_id {
+    load_data();
+    cell state_init = calculate_nft_item_state_init(index);
+    return calculate_nft_item_address(0, state_init);
+}
+
+
+(int, int, slice) royalty_params() method_id {
+    return (0, 100, my_address());
+}
+
+
+cell get_nft_content(int index, cell individual_nft_content) method_id {
+    load_data();
+    slice cs = storage::content.begin_parse();
+    cs~load_ref();
+    slice common_content = cs~load_ref().begin_parse();
+
+    builder string = begin_cell();
+    tuple chars = null();
+    do {
+        int r = index~divmod(10);
+        chars = cons(r + 48, chars);
+    } until (index == 0);
+    do {
+        int char = chars~list_next();
+        string~store_uint(char, 8);
+    } until (null?(chars));
+    
+    return (begin_cell()
+                .store_uint(1, 8)  ;; offchain tag
+                .store_slice(common_content)
+                .store_ref(string.end_cell())
+            .end_cell());
+}
+
+
+(int) get_sale_balance() method_id {
+    load_data();
+    ;; [int balance, cell x] = get_balance();
+    return (
+        ;; balance,
+        storage::available_jettons
+    );
+}
+
+cell get_wl() method_id {
+    load_data();
+
+    return storage::whitelist;
+}
+
+
+(slice, int, cell, cell, int, int, int, int, slice, cell, slice, int, int, int, int) get_all_data() method_id {
+    load_data();
+    
+    return (
+        storage::owner_address,        
+        storage::next_item_index,          
+        storage::content,                 
+        storage::nft_item_code,           
+        storage::min_purchase_ton,         
+        storage::price_factor,            
+        storage::price_devider,            
+        storage::available_jettons,        
+        storage::jetton_minter_address,  
+        storage::jetton_wallet_code,      
+        storage::jetton_wallet_address,   
+        storage::first_unlock_time,        
+        storage::initial_unlock,           
+        storage::cycle_length,
+        storage::cycles_number
+    );
+}
