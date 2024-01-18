@@ -22,7 +22,10 @@ export class SbtNft implements Contract {
 
     static createFromConfig(config: SbtNftConfig, code: Cell, workchain = 0) {
         const data = sbtNftConfigToCell(config);
-        const init = { code, data };
+        const init = {
+            code,
+            data,
+        };
         return new SbtNft(contractAddress(workchain, init), init);
     }
 
